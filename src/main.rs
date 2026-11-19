@@ -1,7 +1,6 @@
 //! LFM Assetto Corsa mod sync — Ratatui front-end.
 //!
-//! Reimplements the AC mod-sync subsystem of the LFM App (see
-//! ../LFM-AC-SYNC-ANALYSIS.md) as an interactive terminal UI.
+//! Reimplements the AC mod-sync subsystem of the LFM App as an interactive terminal UI.
 
 mod ac;
 mod api;
