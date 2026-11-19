@@ -1,4 +1,4 @@
-# lfm-ac
+# lfm-ac-tui
 
 A terminal client for [Low Fuel Motorsport](https://lowfuelmotorsport.com) on Assetto Corsa.
 It keeps the mods a season requires in sync, shows the practice servers and upcoming races,
