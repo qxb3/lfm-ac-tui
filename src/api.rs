@@ -18,6 +18,9 @@ pub const PIT_BASE: &str = "https://api.livery.lowfuelmotorsport.com/api/v1/";
 /// version this implementation was built against.
 pub const APP_VERSION: &str = "1.1.13";
 
+/// LFM's sim id for Assetto Corsa (the season payload groups AC under `"3"`).
+const AC_SIM_ID: u32 = 3;
+
 #[derive(Clone)]
 pub struct ApiClient {
     http: reqwest::Client,
@@ -63,8 +66,12 @@ impl ApiClient {
     }
 
     fn pit(&self, path: &str) -> reqwest::RequestBuilder {
+        self.pit_req(reqwest::Method::GET, path)
+    }
+
+    fn pit_req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         self.http
-            .get(format!("{PIT_BASE}{path}"))
+            .request(method, format!("{PIT_BASE}{path}"))
             .header("X-API-Key", format!("Bearer {}", self.token()))
             .header("X-App-Version", APP_VERSION)
     }
@@ -116,6 +123,67 @@ impl ApiClient {
         send_json(self.lfm(&format!("race/{race_id}/getJoinData"))).await
     }
 
+    /// The signed-in user (`GET user`). The signup payload needs the name and id.
+    pub async fn user(&self) -> Result<UserDto> {
+        send_json(self.lfm("user")).await
+    }
+
+    /// Cars this race accepts: `v2/seasons/getAvailableCars/{event}?race_id={race}`.
+    pub async fn available_cars(&self, event_id: u32, race_id: u32) -> Result<Vec<AvailableCar>> {
+        let value: Value = send_json(self.lfm(&format!(
+            "v2/seasons/getAvailableCars/{event_id}?race_id={race_id}"
+        )))
+        .await?;
+        // Newer builds wrap the list in `{ "data": [...] }`; older ones return an array.
+        let list = value.get("data").cloned().unwrap_or(value);
+        serde_json::from_value(list).context("decoding the available cars list")
+    }
+
+    /// Register the signed-in driver for a solo race.
+    pub async fn signup(
+        &self,
+        race_id: u32,
+        event_id: u32,
+        car_id: i64,
+        user: &UserDto,
+    ) -> Result<()> {
+        let body = serde_json::json!([{
+            "vorname": user.vorname,
+            "nachname": user.nachname,
+            "userid": user.id,
+            "driver_no": 0,
+        }]);
+
+        let res = self
+            .pit_req(reqwest::Method::POST, &format!("signup/{race_id}/solo"))
+            .query(&[
+                ("carModel", car_id.to_string()),
+                ("liveryId", "0".to_string()),
+                ("teamId", "0".to_string()),
+                ("teamName", String::new()),
+                ("simId", AC_SIM_ID.to_string()),
+                ("eventId", event_id.to_string()),
+            ])
+            .json(&body)
+            .send()
+            .await
+            .context("signup request failed")?;
+
+        check_ok(res).await
+    }
+
+    /// Withdraw the signed-in driver from a solo race.
+    pub async fn withdraw(&self, race_id: u32, event_id: u32) -> Result<()> {
+        let res = self
+            .pit_req(reqwest::Method::DELETE, &format!("signup/{race_id}/solo"))
+            .query(&[("eventId", event_id.to_string())])
+            .send()
+            .await
+            .context("withdraw request failed")?;
+
+        check_ok(res).await
+    }
+
     /// Plain-text minimum client version.
     pub async fn required_version(&self) -> Result<String> {
         let res = self.pit("version/hub").send().await?;
@@ -148,6 +216,35 @@ async fn send_json<T: DeserializeOwned>(req: reqwest::RequestBuilder) -> Result<
             truncate(&text, 240)
         )
     })
+}
+
+/// Signup/withdraw return either an empty body or a JSON error (`status`, `title`).
+async fn check_ok(res: reqwest::Response) -> Result<()> {
+    let status = res.status();
+    if status.is_success() {
+        return Ok(());
+    }
+
+    let text = res.text().await.unwrap_or_default();
+    let detail = serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|value| {
+            let title = value.get("title").and_then(Value::as_str);
+            let state = value.get("status").and_then(Value::as_str);
+            match (title, state) {
+                (Some(title), Some(state)) => Some(format!("{title} ({state})")),
+                (Some(title), None) => Some(title.to_string()),
+                (None, Some(state)) => Some(state.to_string()),
+                (None, None) => None,
+            }
+        })
+        .unwrap_or_else(|| truncate(&text, 240));
+
+    let hint = match status.as_u16() {
+        401 | 403 => " (token rejected — check --api-key / the LFM App login)",
+        _ => "",
+    };
+    bail!("HTTP {status}{hint}: {detail}")
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -337,6 +434,27 @@ pub struct JoinDataDto {
     pub servername: Option<String>,
     #[serde(default)]
     pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UserDto {
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub vorname: String,
+    #[serde(default)]
+    pub nachname: String,
+}
+
+/// One car offered by `getAvailableCars` for a race.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AvailableCar {
+    #[serde(default, alias = "id")]
+    pub car_id: i64,
+    #[serde(default, alias = "name")]
+    pub car_name: String,
+    #[serde(default, alias = "class_name")]
+    pub class: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

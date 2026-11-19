@@ -92,6 +92,26 @@ pub struct RaceInfo {
     pub signup_closes: String,
 }
 
+/// A car the server accepts for one race, as offered in the sign-up popup.
+#[derive(Clone, Debug, Default)]
+pub struct CarOption {
+    /// Server's `carModel` value used in the signup query.
+    pub id: i64,
+    pub name: String,
+    pub class: String,
+}
+
+impl CarOption {
+    /// `GT3 · Porsche 911 GT3 R` — the class is skipped when the API omits it.
+    pub fn label(&self) -> String {
+        if self.class.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{} · {}", self.class, self.name)
+        }
+    }
+}
+
 /// Resolved join data shown in the popup.
 #[derive(Clone, Debug, Default)]
 pub struct JoinInfo {

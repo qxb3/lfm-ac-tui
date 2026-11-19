@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Confirm, Focus, SessionRow, View};
+use crate::app::{App, Confirm, Focus, SessionRow, SignupPopup, View};
 use crate::model::{human_bytes, ContentItem, JoinInfo, RaceInfo, Status};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -34,6 +34,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(info) = app.join_popup.clone() {
         draw_join_popup(frame, area, &info);
+    }
+    if let Some(popup) = app.signup_popup.clone() {
+        draw_signup_popup(frame, area, &popup);
     }
     if let Some(Confirm::Purge(ids)) = app.confirm.clone() {
         draw_confirm(frame, area, ids.len());
@@ -494,7 +497,9 @@ fn draw_transfer(frame: &mut Frame, app: &App, area: Rect) {
             frame.render_widget(gauge, area);
         }
         None => {
-            let text = if app.join_loading {
+            let text = if app.signup_popup.as_ref().is_some_and(|p| p.submitting) {
+                "sending sign-up…".to_string()
+            } else if app.join_loading {
                 "resolving join data…".to_string()
             } else if app.busy {
                 format!("{} working…", app.busy_spinner())
@@ -540,7 +545,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             "space marks an item · s installs the marked ones (or everything missing here) · v re-checks the disk"
         }
         (View::Sessions, _) => {
-            "enter opens a practice link or race details · o in the popup starts Assetto Corsa with the link"
+            "enter opens a practice link or race details · R signs up for the highlighted race"
         }
     };
 
@@ -549,7 +554,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             "j/k move · Tab pane · space select · a all · s sync · v verify · d purge · r refresh · L login · ? help · q quit"
         }
         View::Sessions => {
-            "j/k move · Tab pane · enter open · w next week · o series page · r reload · L login · ? help · q quit"
+            "j/k move · Tab pane · enter open · R sign up · w next week · o series page · r reload · L login · ? help · q quit"
         }
     };
 
@@ -624,6 +629,117 @@ fn draw_join_popup(frame: &mut Frame, area: Rect, info: &JoinInfo) {
     );
 }
 
+fn draw_signup_popup(frame: &mut Frame, area: Rect, popup: &SignupPopup) {
+    let rect = centered(area, 74, 60);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            popup.label.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "{}/{} slots · signup closes {}",
+                popup.registered, popup.slots, popup.signup_closes
+            ),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(""),
+    ];
+
+    if popup.signed_up {
+        lines.push(Line::from(Span::styled(
+            "✔ You are registered for this race.",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "u withdraw · Esc close",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else if popup.loading {
+        lines.push(Line::from(Span::styled(
+            "Loading the cars available for this race…",
+            Style::default().fg(Color::Yellow),
+        )));
+    } else if let Some(error) = &popup.error {
+        lines.extend([
+            Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red))),
+            Line::from(""),
+            Line::from(Span::styled(
+                "r retry · Esc close",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]);
+    } else if popup.cars.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No cars were offered for this race.",
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Esc close",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Car",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        // Show a window around the selection so long car lists stay inside the dialog.
+        const VISIBLE: usize = 14;
+        let start = popup
+            .selected
+            .saturating_sub(VISIBLE / 2)
+            .min(popup.cars.len().saturating_sub(VISIBLE));
+        let end = (start + VISIBLE).min(popup.cars.len());
+
+        for index in start..end {
+            let car = &popup.cars[index];
+            let selected = index == popup.selected;
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "▶ " } else { "  " },
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    clip(&car.label(), 62),
+                    if selected {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                ),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        if popup.submitting {
+            lines.push(Line::from(Span::styled(
+                "Sending the sign-up to LFM…",
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "j/k choose a car · enter register · r reload · Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(dark_block("Race sign-up", true))
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
+}
+
 fn draw_help(frame: &mut Frame, area: Rect) {
     let popup = centered(area, 92, 94);
 
@@ -665,6 +781,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  enter   open the practice join link or the race details"),
         Line::from("  o       in the popup: start Assetto Corsa through Steam with the link"),
         Line::from("  c / y   copy the join link / the race password"),
+        Line::from("  R       sign up for the highlighted race (pick a car first); u withdraws"),
         Line::from("  w       include next week's practice servers"),
         Line::from("  o       otherwise: open the series page on lowfuelmotorsport.com"),
         Line::from(""),

@@ -77,6 +77,7 @@ Sessions tab:
 | Key | Action |
 |---|---|
 | `enter` | join the selected practice server / resolve a race's join link |
+| `R` | sign up for the highlighted race (pick a car) or withdraw |
 | `w` | show next week's practice servers as well |
 | `o` | open the series page on lowfuelmotorsport.com |
 | `r` | reload the race list for the selected series |
@@ -84,6 +85,10 @@ Sessions tab:
 
 In the join popup: `o` opens the link, `c` copies it, `y` copies the server password, `Esc`
 closes.
+
+In the sign-up popup: `j`/`k` choose a car, `enter` registers, `r` reloads the car list,
+`u` withdraws when you are already registered, and `Esc` cancels. Errors from LFM (sign-ups
+closed, full grid, missing safety rating) stay in the dialog so the reason is visible.
 
 Status tags: `ok` installed, `part` nearly complete (shows `found/expected`), `upd` version
 changed, `new` missing, `ext` not in the catalogue (download it from the modder), `dlc` official
@@ -105,8 +110,13 @@ answers once the server is live and you are signed up; otherwise the popup expla
 the game's prefix, so a host handler cannot work. Instead the link is handed to Steam
 (`steam -applaunch 244210 "acmanager://…"`), which starts Assetto Corsa in its normal Proton
 environment with the URL on the command line; Content Manager — the game's launcher here —
-picks it up and opens the join dialog. Sign-ups themselves stay on the website (`o` in the
-Sessions tab).
+picks it up and opens the join dialog.
+
+`R` registers directly: the car list comes from
+`v2/seasons/getAvailableCars/{event_id}?race_id=…`, and the sign-up is
+`POST signup/{race_id}/solo` on the PitPath API with `carModel`, `eventId` and `simId=3`.
+Withdrawing uses `DELETE signup/{race_id}/solo?eventId=…`. Both mirror the LFM App's own
+`RaceCard`, with `liveryId=0` and no team (AC series here are solo).
 
 ## Behaviour notes
 

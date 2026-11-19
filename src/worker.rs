@@ -16,8 +16,8 @@ use crate::api::{
     SeriesRef,
 };
 use crate::model::{
-    human_bytes, ContentItem, ContentKind, JoinInfo, PracticeLink, ProgressView, RaceInfo, Series,
-    Status,
+    human_bytes, CarOption, ContentItem, ContentKind, JoinInfo, PracticeLink, ProgressView, RaceInfo,
+    Series, Status,
 };
 use crate::session;
 
@@ -32,6 +32,21 @@ pub enum Command {
     Sessions(u32),
     /// Resolve the join link/password for a race.
     JoinRace { race_id: u32, label: String },
+    /// Cars the server accepts for a race, for the sign-up picker.
+    RaceCars { race_id: u32, event_id: u32 },
+    /// Register for a race with the chosen car.
+    SignUp {
+        race_id: u32,
+        event_id: u32,
+        car_id: i64,
+        label: String,
+    },
+    /// Withdraw from a race.
+    Withdraw {
+        race_id: u32,
+        event_id: u32,
+        label: String,
+    },
     /// Log in through the browser and store the API key.
     Login,
 }
@@ -47,6 +62,10 @@ pub enum Event {
     Progress(Option<ProgressView>),
     Sessions { event_id: u32, races: Vec<RaceInfo> },
     JoinInfo(JoinInfo),
+    /// Available cars for a race (`error` is set when the fetch failed).
+    RaceCars { race_id: u32, cars: Vec<CarOption>, error: Option<String> },
+    /// Outcome of a signup/withdraw. `ok == false` leaves the popup open with `message`.
+    SignupResult { race_id: u32, signed_up: bool, ok: bool, message: String },
     LoggedIn,
 }
 
@@ -79,6 +98,31 @@ impl Worker {
                 Command::JoinRace { race_id, label } => {
                     spawn_join(self.api.clone(), self.tx.clone(), race_id, label);
                 }
+                Command::RaceCars { race_id, event_id } => {
+                    spawn_race_cars(self.api.clone(), self.tx.clone(), race_id, event_id);
+                }
+                Command::SignUp {
+                    race_id,
+                    event_id,
+                    car_id,
+                    label,
+                } => {
+                    spawn_signup(
+                        self.api.clone(),
+                        self.tx.clone(),
+                        race_id,
+                        event_id,
+                        car_id,
+                        label,
+                    );
+                }
+                Command::Withdraw {
+                    race_id,
+                    event_id,
+                    label,
+                } => {
+                    spawn_withdraw(self.api.clone(), self.tx.clone(), race_id, event_id, label);
+                }
                 command => {
                     let api = self.api.clone();
                     let ac_path = self.ac_path.clone();
@@ -109,7 +153,11 @@ impl Worker {
             Command::Verify(ids) => self.verify(ids).await,
             Command::Purge(ids) => self.purge(ids).await,
             Command::Scripts => self.scripts().await,
-            Command::Sessions(_) | Command::JoinRace { .. } => unreachable!(),
+            Command::Sessions(_)
+            | Command::JoinRace { .. }
+            | Command::RaceCars { .. }
+            | Command::SignUp { .. }
+            | Command::Withdraw { .. } => unreachable!(),
         }
     }
 
@@ -657,6 +705,99 @@ async fn fetch_join(
             }));
         }
     }
+}
+
+fn spawn_race_cars(
+    api: ApiClient,
+    tx: mpsc::UnboundedSender<Event>,
+    race_id: u32,
+    event_id: u32,
+) {
+    tokio::spawn(async move {
+        match api.available_cars(event_id, race_id).await {
+            Ok(cars) => {
+                let mut options: Vec<CarOption> = cars
+                    .into_iter()
+                    .filter(|car| car.car_id != 0)
+                    .map(|car| CarOption {
+                        id: car.car_id,
+                        name: if car.car_name.is_empty() {
+                            format!("car {}", car.car_id)
+                        } else {
+                            car.car_name
+                        },
+                        class: car.class,
+                    })
+                    .collect();
+                options.sort_by_key(|car| car.name.to_lowercase());
+                options.dedup_by_key(|car| car.id);
+                let _ = tx.send(Event::RaceCars {
+                    race_id,
+                    cars: options,
+                    error: None,
+                });
+            }
+            Err(error) => {
+                let _ = tx.send(Event::Log(format!("available cars for race {race_id}: {error:#}")));
+                let _ = tx.send(Event::RaceCars {
+                    race_id,
+                    cars: Vec::new(),
+                    error: Some(format!("{error:#}")),
+                });
+            }
+        }
+    });
+}
+
+fn spawn_signup(
+    api: ApiClient,
+    tx: mpsc::UnboundedSender<Event>,
+    race_id: u32,
+    event_id: u32,
+    car_id: i64,
+    label: String,
+) {
+    tokio::spawn(async move {
+        let result = async {
+            let user = api.user().await.context("fetching your LFM profile")?;
+            api.signup(race_id, event_id, car_id, &user).await
+        }
+        .await;
+
+        let (ok, message) = match result {
+            Ok(()) => (true, format!("Registered for {label}")),
+            Err(error) => (false, format!("Could not register for {label}: {error:#}")),
+        };
+        let _ = tx.send(Event::Log(message.clone()));
+        let _ = tx.send(Event::SignupResult {
+            race_id,
+            signed_up: true,
+            ok,
+            message,
+        });
+    });
+}
+
+fn spawn_withdraw(
+    api: ApiClient,
+    tx: mpsc::UnboundedSender<Event>,
+    race_id: u32,
+    event_id: u32,
+    label: String,
+) {
+    tokio::spawn(async move {
+        let (ok, message) = match api.withdraw(race_id, event_id).await {
+            Ok(()) => (true, format!("Withdrew from {label}")),
+            Err(error) => (false, format!("Could not withdraw from {label}: {error:#}")),
+        };
+        let _ = tx.send(Event::Log(message.clone()));
+        let _ = tx.send(Event::SignupResult {
+            race_id,
+            signed_up: false,
+            ok,
+            message,
+        });
+    });
 }
 
 // ---------------------------------------------------------------------------

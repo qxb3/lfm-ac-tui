@@ -12,7 +12,7 @@ use ratatui::widgets::ListState;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::model::{
-    ContentItem, JoinInfo, PracticeLink, ProgressView, RaceInfo, Series, Status,
+    CarOption, ContentItem, JoinInfo, PracticeLink, ProgressView, RaceInfo, Series, Status,
 };
 use crate::session;
 use crate::worker::{Command, Event};
@@ -53,6 +53,23 @@ enum Pane {
     Series,
     Content,
     Sessions,
+}
+
+/// Sign-up dialog: pick a car for an upcoming race, or withdraw from one already booked.
+#[derive(Clone, Debug, Default)]
+pub struct SignupPopup {
+    pub race_id: u32,
+    pub event_id: u32,
+    pub label: String,
+    pub slots: u32,
+    pub registered: u32,
+    pub signup_closes: String,
+    pub signed_up: bool,
+    pub loading: bool,
+    pub submitting: bool,
+    pub cars: Vec<CarOption>,
+    pub selected: usize,
+    pub error: Option<String>,
 }
 
 /// A row of the sessions pane. Headers and notes are not selectable.
@@ -105,6 +122,7 @@ pub struct App {
     pub show_next_week: bool,
     pub join_popup: Option<JoinInfo>,
     pub join_loading: bool,
+    pub signup_popup: Option<SignupPopup>,
 
     /// Filled in by the renderer on every frame.
     pub regions: Regions,
@@ -147,6 +165,7 @@ impl App {
             show_next_week: false,
             join_popup: None,
             join_loading: false,
+            signup_popup: None,
             regions: Regions::default(),
             last_click: None,
         }
@@ -375,6 +394,129 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    // -------------------------------------------------------------- signup
+
+    /// Open the sign-up dialog for the highlighted race, loading its car list.
+    fn open_signup(&mut self) {
+        let Some(SessionRow::Race(index)) = self.selected_session() else {
+            self.log("Select an upcoming race first");
+            return;
+        };
+        let Some(race) = self.races.get(index).cloned() else {
+            return;
+        };
+        let Some(event_id) = self.current_series().map(|s| s.event_id) else {
+            return;
+        };
+
+        let label = if race.track.is_empty() {
+            format!("race {}", race.race_id)
+        } else {
+            format!("{} — {}", race.track, race.date)
+        };
+
+        self.signup_popup = Some(SignupPopup {
+            race_id: race.race_id,
+            event_id,
+            label: label.clone(),
+            slots: race.slots,
+            registered: race.registered,
+            signup_closes: race.signup_closes.clone(),
+            signed_up: race.signed_up,
+            loading: !race.signed_up,
+            ..SignupPopup::default()
+        });
+
+        if race.signed_up {
+            self.log(format!("{label}: you are already registered — u withdraws"));
+        } else {
+            self.log(format!("Loading the cars available for {label}…"));
+            let _ = self.tx.send(Command::RaceCars {
+                race_id: race.race_id,
+                event_id,
+            });
+        }
+    }
+
+    fn handle_signup_popup_key(&mut self, key: KeyEvent) {
+        // Take the popup so the handlers can borrow `self` freely; putting it back keeps it
+        // open, leaving it dropped closes the dialog.
+        let Some(mut popup) = self.signup_popup.take() else {
+            return;
+        };
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return,
+
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !popup.cars.is_empty() {
+                    popup.selected = (popup.selected + 1).min(popup.cars.len() - 1);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                popup.selected = popup.selected.saturating_sub(1);
+            }
+            KeyCode::Home | KeyCode::Char('g') => popup.selected = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                popup.selected = popup.cars.len().saturating_sub(1);
+            }
+
+            KeyCode::Enter => {
+                if popup.submitting || popup.loading {
+                    // A request is already in flight.
+                } else if popup.signed_up {
+                    self.log("You are already registered — press u to withdraw");
+                } else if let Some(car) = popup.cars.get(popup.selected) {
+                    popup.submitting = true;
+                    popup.error = None;
+                    self.log(format!(
+                        "Registering for {} with {}…",
+                        popup.label, car.name
+                    ));
+                    let _ = self.tx.send(Command::SignUp {
+                        race_id: popup.race_id,
+                        event_id: popup.event_id,
+                        car_id: car.id,
+                        label: popup.label.clone(),
+                    });
+                } else {
+                    self.log("No car selected — no cars were offered for this race");
+                }
+            }
+
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                if popup.signed_up && !popup.submitting {
+                    popup.submitting = true;
+                    popup.error = None;
+                    self.log(format!("Withdrawing from {}…", popup.label));
+                    let _ = self.tx.send(Command::Withdraw {
+                        race_id: popup.race_id,
+                        event_id: popup.event_id,
+                        label: popup.label.clone(),
+                    });
+                } else if !popup.signed_up {
+                    self.log("You are not registered for this race");
+                }
+            }
+
+            KeyCode::Char('r') if !popup.signed_up && !popup.submitting => {
+                popup.loading = true;
+                popup.error = None;
+                popup.cars.clear();
+                popup.selected = 0;
+                self.log(format!("Reloading cars for {}…", popup.label));
+                let _ = self.tx.send(Command::RaceCars {
+                    race_id: popup.race_id,
+                    event_id: popup.event_id,
+                });
+            }
+
+            _ => {}
+        }
+
+        self.signup_popup = Some(popup);
     }
 
     fn open_series_page(&mut self) {
@@ -614,6 +756,46 @@ impl App {
 
     pub fn on_event(&mut self, event: Event) {
         match event {
+            Event::RaceCars {
+                race_id,
+                cars,
+                error,
+            } => {
+                if let Some(popup) = self
+                    .signup_popup
+                    .as_mut()
+                    .filter(|popup| popup.race_id == race_id)
+                {
+                    popup.loading = false;
+                    popup.cars = cars;
+                    popup.selected = 0;
+                    popup.error = error;
+                }
+            }
+            Event::SignupResult {
+                race_id,
+                signed_up,
+                ok,
+                message,
+            } => {
+                if !ok {
+                    if let Some(popup) = self
+                        .signup_popup
+                        .as_mut()
+                        .filter(|popup| popup.race_id == race_id)
+                    {
+                        popup.submitting = false;
+                        popup.error = Some(message);
+                    }
+                    return;
+                }
+
+                if let Some(race) = self.races.iter_mut().find(|race| race.race_id == race_id) {
+                    race.signed_up = signed_up;
+                }
+                self.signup_popup = None;
+                self.reload_sessions();
+            }
             Event::Log(msg) => self.log(msg),
             Event::Season(series) => {
                 self.series = series;
@@ -679,6 +861,11 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        if self.signup_popup.is_some() {
+            self.handle_signup_popup_key(key);
+            return;
+        }
+
         if let Some(popup) = self.join_popup.clone() {
             self.handle_join_popup_key(key, popup);
             return;
@@ -802,6 +989,10 @@ impl App {
         // Any click dismisses the help overlay first, like a modal dialog.
         if self.show_help {
             self.show_help = false;
+            return;
+        }
+        if self.signup_popup.is_some() {
+            self.signup_popup = None;
             return;
         }
         if self.join_popup.is_some() {
@@ -973,6 +1164,7 @@ impl App {
                 self.show_next_week = !self.show_next_week;
                 self.select_first_session();
             }
+            KeyCode::Char('R') => self.open_signup(),
             KeyCode::Char('r') => self.reload_sessions(),
             KeyCode::Char('o') => self.open_series_page(),
             KeyCode::Char('L') => self.start_login(),
@@ -1054,6 +1246,83 @@ fn row_index(rect: Rect, offset: usize, row: u16, len: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn signup_app() -> (App, tokio::sync::mpsc::UnboundedReceiver<Command>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(tx, None, true, HashSet::new());
+        app.signup_popup = Some(SignupPopup {
+            race_id: 7,
+            event_id: 42,
+            label: "Monza — 2026-11-20".to_string(),
+            slots: 40,
+            registered: 12,
+            cars: vec![
+                CarOption { id: 11, name: "GT3 Car".to_string(), class: "GT3".to_string() },
+                CarOption { id: 12, name: "Cup Car".to_string(), class: "CUP".to_string() },
+            ],
+            ..SignupPopup::default()
+        });
+        (app, rx)
+    }
+
+    #[test]
+    fn enter_sends_the_signup_for_the_highlighted_car() {
+        let (mut app, mut rx) = signup_app();
+
+        app.handle_signup_popup_key(KeyEvent::from(KeyCode::Down));
+        app.handle_signup_popup_key(KeyEvent::from(KeyCode::Enter));
+
+        match rx.try_recv() {
+            Ok(Command::SignUp {
+                race_id,
+                event_id,
+                car_id,
+                ..
+            }) => {
+                assert_eq!((race_id, event_id, car_id), (7, 42, 12));
+            }
+            other => panic!("expected a signup command, got {other:?}"),
+        }
+        assert!(app.signup_popup.as_ref().unwrap().submitting);
+    }
+
+    #[test]
+    fn withdraw_only_when_registered() {
+        let (mut app, mut rx) = signup_app();
+
+        app.handle_signup_popup_key(KeyEvent::from(KeyCode::Char('u')));
+        assert!(rx.try_recv().is_err());
+
+        app.signup_popup.as_mut().unwrap().signed_up = true;
+        app.handle_signup_popup_key(KeyEvent::from(KeyCode::Char('u')));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::Withdraw { race_id: 7, .. })
+        ));
+    }
+
+    #[test]
+    fn failed_signup_keeps_the_popup_open_with_the_error() {
+        let (mut app, _rx) = signup_app();
+
+        app.on_event(Event::SignupResult {
+            race_id: 7,
+            signed_up: true,
+            ok: false,
+            message: "signup closed".to_string(),
+        });
+
+        let popup = app.signup_popup.expect("popup stays open");
+        assert_eq!(popup.error.as_deref(), Some("signup closed"));
+        assert!(!popup.submitting);
+    }
+
+    #[test]
+    fn escape_closes_the_signup_popup() {
+        let (mut app, _rx) = signup_app();
+        app.handle_signup_popup_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.signup_popup.is_none());
+    }
 
     #[test]
     fn maps_click_rows_to_indices() {
