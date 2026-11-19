@@ -1,6 +1,6 @@
 [package]
 name = "lfm-ac"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "LFM Assetto Corsa mod sync (ratatui TUI)"
 license = "MIT"
