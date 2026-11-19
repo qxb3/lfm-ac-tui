@@ -60,7 +60,6 @@ redirecting, so the desktop app's own deep link is used.
 | `v` | verify every catalogue item against disk |
 | `d` | purge installed content outside the selection (asks for confirmation) |
 | `x` | install RealPenalty (112) + LFM livery script (114) and toggle the AC ini files |
-| `r` | reload the season from LFM |
 | `L` | log in through the browser (Steam) and save the key |
 | `?` | full guide: what every tab, key and status tag does |
 | `q` | quit |
@@ -77,18 +76,22 @@ Sessions tab:
 | Key | Action |
 |---|---|
 | `enter` | join the selected practice server / resolve a race's join link |
-| `R` | sign up for the highlighted race (pick a car) or withdraw |
+| `s` | sign up for the highlighted race (pick a car) |
+| `u` | sign out of the highlighted race |
 | `w` | show next week's practice servers as well |
 | `o` | open the series page on lowfuelmotorsport.com |
-| `r` | reload the race list for the selected series |
 | `j`/`k` | move through practice servers and races |
 
 In the join popup: `o` opens the link, `c` copies it, `y` copies the server password, `Esc`
 closes.
 
 In the sign-up popup: `j`/`k` choose a car, `enter` registers, `r` reloads the car list,
-`u` withdraws when you are already registered, and `Esc` cancels. Errors from LFM (sign-ups
+`u` signs out when you are already registered, and `Esc` cancels. Errors from LFM (sign-ups
 closed, full grid, missing safety rating) stay in the dialog so the reason is visible.
+
+The race list refreshes itself every minute while the Sessions tab is open, and the season
+(plus installed-content check) every 15 minutes on the Mods tab, so there is no refresh key.
+Refreshes are skipped while a dialog is open or a download/check is running.
 
 Status tags: `ok` installed, `part` nearly complete (shows `found/expected`), `upd` version
 changed, `new` missing, `ext` not in the catalogue (download it from the modder), `dlc` official
@@ -112,10 +115,10 @@ the game's prefix, so a host handler cannot work. Instead the link is handed to 
 environment with the URL on the command line; Content Manager — the game's launcher here —
 picks it up and opens the join dialog.
 
-`R` registers directly: the car list comes from
+`s` registers directly: the car list comes from
 `v2/seasons/getAvailableCars/{event_id}?race_id=…`, and the sign-up is
 `POST signup/{race_id}/solo` on the PitPath API with `carModel`, `eventId` and `simId=3`.
-Withdrawing uses `DELETE signup/{race_id}/solo?eventId=…`. Both mirror the LFM App's own
+`u` signs out with `DELETE signup/{race_id}/solo?eventId=…`. Both mirror the LFM App's own
 `RaceCard`, with `liveryId=0` and no team (AC series here are solo).
 
 ## Behaviour notes

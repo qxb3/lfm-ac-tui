@@ -28,8 +28,9 @@ pub enum Command {
     Verify(Vec<u32>),
     Purge(Vec<u32>),
     Scripts,
-    /// Load the upcoming races of one series (event id).
-    Sessions(u32),
+    /// Load the upcoming races of one series (event id). `quiet` skips the log line for
+    /// the periodic background refresh.
+    Sessions { event_id: u32, quiet: bool },
     /// Resolve the join link/password for a race.
     JoinRace { race_id: u32, label: String },
     /// Cars the server accepts for a race, for the sign-up picker.
@@ -92,8 +93,8 @@ impl Worker {
 
         while let Some(command) = rx.recv().await {
             match command {
-                Command::Sessions(event_id) => {
-                    spawn_sessions(self.api.clone(), self.tx.clone(), event_id);
+                Command::Sessions { event_id, quiet } => {
+                    spawn_sessions(self.api.clone(), self.tx.clone(), event_id, quiet);
                 }
                 Command::JoinRace { race_id, label } => {
                     spawn_join(self.api.clone(), self.tx.clone(), race_id, label);
@@ -153,7 +154,7 @@ impl Worker {
             Command::Verify(ids) => self.verify(ids).await,
             Command::Purge(ids) => self.purge(ids).await,
             Command::Scripts => self.scripts().await,
-            Command::Sessions(_)
+            Command::Sessions { .. }
             | Command::JoinRace { .. }
             | Command::RaceCars { .. }
             | Command::SignUp { .. }
@@ -620,10 +621,19 @@ impl Worker {
 // session lookups (spawned so they never block a mod sync)
 // ---------------------------------------------------------------------------
 
-fn spawn_sessions(api: ApiClient, tx: mpsc::UnboundedSender<Event>, event_id: u32) {
+fn spawn_sessions(
+    api: ApiClient,
+    tx: mpsc::UnboundedSender<Event>,
+    event_id: u32,
+    quiet: bool,
+) {
     tokio::spawn(async move {
-        if let Err(error) = fetch_sessions(api, tx.clone(), event_id).await {
-            let _ = tx.send(Event::Log(format!("sessions: {error:#}")));
+        if let Err(error) = fetch_sessions(api, tx.clone(), event_id, quiet).await {
+            // A background refresh that fails (offline, rate limited) stays silent; the next
+            // user-visible load or the next tick retries.
+            if !quiet {
+                let _ = tx.send(Event::Log(format!("sessions: {error:#}")));
+            }
         }
     });
 }
@@ -632,8 +642,11 @@ async fn fetch_sessions(
     api: ApiClient,
     tx: mpsc::UnboundedSender<Event>,
     event_id: u32,
+    quiet: bool,
 ) -> Result<()> {
-    let _ = tx.send(Event::Log(format!("Loading sessions for event {event_id}…")));
+    if !quiet {
+        let _ = tx.send(Event::Log(format!("Loading sessions for event {event_id}…")));
+    }
     let races = api.upcoming_sessions(event_id).await?;
     let races: Vec<RaceInfo> = races.iter().map(map_race).collect();
     let _ = tx.send(Event::Sessions { event_id, races });

@@ -545,16 +545,16 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             "space marks an item · s installs the marked ones (or everything missing here) · v re-checks the disk"
         }
         (View::Sessions, _) => {
-            "enter opens a practice link or race details · R signs up for the highlighted race"
+            "enter opens a practice link or race details · s signs up · u signs out"
         }
     };
 
     let keys = match app.view {
         View::Mods => {
-            "j/k move · Tab pane · space select · a all · s sync · v verify · d purge · r refresh · L login · ? help · q quit"
+            "j/k move · Tab pane · space select · a all · s sync · v verify · d purge · L login · ? help · q quit"
         }
         View::Sessions => {
-            "j/k move · Tab pane · enter open · R sign up · w next week · o series page · r reload · L login · ? help · q quit"
+            "j/k move · Tab pane · enter open · s sign up · u sign out · w next week · o series page · L login · ? help · q quit"
         }
     };
 
@@ -766,7 +766,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  v       re-check every catalogue item against the disk (no downloads)"),
         Line::from("  d       delete installed content that is not marked (asks first)"),
         Line::from("  x       install RealPenalty + the LFM livery script and enable them in AC"),
-        Line::from("  r       reload the season from LFM"),
+        dim("  the season and race lists refresh automatically while you use the app"),
         Line::from(""),
         head("STATUS TAGS"),
         Line::from("  ok      every file in the mod's file list is on disk"),
@@ -781,7 +781,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  enter   open the practice join link or the race details"),
         Line::from("  o       in the popup: start Assetto Corsa through Steam with the link"),
         Line::from("  c / y   copy the join link / the race password"),
-        Line::from("  R       sign up for the highlighted race (pick a car first); u withdraws"),
+        Line::from("  s       sign up for the highlighted race (pick a car first)"),
+        Line::from("  u       sign out of the highlighted race"),
         Line::from("  w       include next week's practice servers"),
         Line::from("  o       otherwise: open the series page on lowfuelmotorsport.com"),
         Line::from(""),

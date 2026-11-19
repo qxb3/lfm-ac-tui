@@ -17,6 +17,11 @@ use crate::model::{
 use crate::session;
 use crate::worker::{Command, Event};
 
+/// Race lists are cheap to fetch, so keep them current while the tab is open.
+const SESSIONS_REFRESH: Duration = Duration::from_secs(60);
+/// The season payload also triggers a full integrity scan, so refresh it rarely.
+const SEASON_REFRESH: Duration = Duration::from_secs(15 * 60);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Series,
@@ -123,6 +128,10 @@ pub struct App {
     pub join_popup: Option<JoinInfo>,
     pub join_loading: bool,
     pub signup_popup: Option<SignupPopup>,
+    /// Last race-list request, for the automatic refresh.
+    last_sessions_refresh: Option<Instant>,
+    /// Last season refresh, for the automatic refresh.
+    last_season_refresh: Instant,
 
     /// Filled in by the renderer on every frame.
     pub regions: Regions,
@@ -166,6 +175,8 @@ impl App {
             join_popup: None,
             join_loading: false,
             signup_popup: None,
+            last_sessions_refresh: None,
+            last_season_refresh: Instant::now(),
             regions: Regions::default(),
             last_click: None,
         }
@@ -216,6 +227,45 @@ impl App {
 
     pub fn tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
+        self.auto_refresh();
+    }
+
+    /// Keep the visible data current without a refresh key. Nothing runs while a modal is
+    /// open, the app is busy, or no token is present.
+    fn auto_refresh(&mut self) {
+        if self.busy
+            || !self.token_present
+            || self.show_help
+            || self.confirm.is_some()
+            || self.join_popup.is_some()
+            || self.signup_popup.is_some()
+        {
+            return;
+        }
+
+        match self.view {
+            View::Sessions => {
+                let due = self
+                    .last_sessions_refresh
+                    .is_some_and(|at| at.elapsed() >= SESSIONS_REFRESH);
+                if due && !self.races_loading {
+                    if let Some(event_id) = self.current_series().map(|s| s.event_id) {
+                        self.last_sessions_refresh = Some(Instant::now());
+                        let _ = self.tx.send(Command::Sessions {
+                            event_id,
+                            quiet: true,
+                        });
+                    }
+                }
+            }
+            View::Mods => {
+                if self.last_season_refresh.elapsed() >= SEASON_REFRESH {
+                    self.last_season_refresh = Instant::now();
+                    self.races_event = None;
+                    let _ = self.tx.send(Command::Refresh);
+                }
+            }
+        }
     }
 
     pub fn stats(&self) -> (usize, usize, usize) {
@@ -340,7 +390,11 @@ impl App {
         self.races_loading = true;
         self.races_event = Some(event_id);
         self.sessions_state.select(None);
-        let _ = self.tx.send(Command::Sessions(event_id));
+        self.last_sessions_refresh = Some(Instant::now());
+        let _ = self.tx.send(Command::Sessions {
+            event_id,
+            quiet: false,
+        });
     }
 
     fn reload_sessions(&mut self) {
@@ -399,6 +453,36 @@ impl App {
     // -------------------------------------------------------------- signup
 
     /// Open the sign-up dialog for the highlighted race, loading its car list.
+    /// Sign out of the highlighted race directly, without opening the picker.
+    fn sign_out(&mut self) {
+        let Some(SessionRow::Race(index)) = self.selected_session() else {
+            self.log("Select an upcoming race first");
+            return;
+        };
+        let Some(race) = self.races.get(index).cloned() else {
+            return;
+        };
+        if !race.signed_up {
+            self.log("You are not signed up for this race");
+            return;
+        }
+        let Some(event_id) = self.current_series().map(|s| s.event_id) else {
+            return;
+        };
+        let label = if race.track.is_empty() {
+            format!("race {}", race.race_id)
+        } else {
+            format!("{} — {}", race.track, race.date)
+        };
+
+        self.log(format!("Signing out of {label}…"));
+        let _ = self.tx.send(Command::Withdraw {
+            race_id: race.race_id,
+            event_id,
+            label,
+        });
+    }
+
     fn open_signup(&mut self) {
         let Some(SessionRow::Race(index)) = self.selected_session() else {
             self.log("Select an upcoming race first");
@@ -730,16 +814,6 @@ impl App {
         self.confirm = Some(Confirm::Purge(ids));
     }
 
-    fn refresh(&mut self) {
-        if self.busy {
-            self.log("Busy — wait for the running task");
-            return;
-        }
-        self.statuses.clear();
-        self.races_event = None;
-        let _ = self.tx.send(Command::Refresh);
-    }
-
     fn run_scripts(&mut self) {
         if self.busy {
             self.log("Busy — wait for the running task");
@@ -847,10 +921,33 @@ impl App {
             }
             Event::Sessions { event_id, races } => {
                 if self.races_event == Some(event_id) {
+                    // The list is also replaced by the one-minute background refresh, so keep
+                    // the highlighted race instead of jumping back to the first row.
+                    let previous = match self.selected_session() {
+                        Some(SessionRow::Race(index)) => {
+                            self.races.get(index).map(|race| race.race_id)
+                        }
+                        _ => None,
+                    };
+
                     self.races = races;
                     self.races_loading = false;
                     self.races_error = None;
-                    self.select_first_session();
+                    self.last_sessions_refresh = Some(Instant::now());
+
+                    let rows = self.session_rows();
+                    let same_race = previous.and_then(|race_id| {
+                        rows.iter().position(|row| {
+                            matches!(row, SessionRow::Race(index)
+                                if self.races.get(*index)
+                                    .is_some_and(|race| race.race_id == race_id))
+                        })
+                    });
+
+                    match same_race {
+                        Some(index) => self.sessions_state.select(Some(index)),
+                        None => self.select_first_session(),
+                    }
                 }
             }
             Event::JoinInfo(info) => {
@@ -1123,7 +1220,6 @@ impl App {
             KeyCode::Char('s') => self.start_sync(),
             KeyCode::Char('v') => self.start_verify(),
             KeyCode::Char('d') => self.ask_purge(),
-            KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('x') => self.run_scripts(),
             KeyCode::Char('L') => self.start_login(),
 
@@ -1164,8 +1260,8 @@ impl App {
                 self.show_next_week = !self.show_next_week;
                 self.select_first_session();
             }
-            KeyCode::Char('R') => self.open_signup(),
-            KeyCode::Char('r') => self.reload_sessions(),
+            KeyCode::Char('s') => self.open_signup(),
+            KeyCode::Char('u') => self.sign_out(),
             KeyCode::Char('o') => self.open_series_page(),
             KeyCode::Char('L') => self.start_login(),
 
@@ -1315,6 +1411,54 @@ mod tests {
         let popup = app.signup_popup.expect("popup stays open");
         assert_eq!(popup.error.as_deref(), Some("signup closed"));
         assert!(!popup.submitting);
+    }
+
+    fn sessions_app(signed_up: bool) -> (App, tokio::sync::mpsc::UnboundedReceiver<Command>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(tx, None, true, HashSet::new());
+        app.series = vec![Series {
+            event_id: 42,
+            name: "GT3".to_string(),
+            style: String::new(),
+            active_week: 1,
+            slug: String::new(),
+            practice_this_week: Vec::new(),
+            practice_next_week: Vec::new(),
+            content: Vec::new(),
+        }];
+        app.series_state.select(Some(0));
+        app.races = vec![RaceInfo {
+            race_id: 9,
+            track: "Monza".to_string(),
+            date: "2026-11-20 18:00:00".to_string(),
+            signed_up,
+            ..RaceInfo::default()
+        }];
+        // Session rows: header, then the race.
+        app.sessions_state.select(Some(1));
+        (app, rx)
+    }
+
+    #[test]
+    fn signs_out_of_the_highlighted_race() {
+        let (mut app, mut rx) = sessions_app(true);
+        app.sign_out();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::Withdraw {
+                race_id: 9,
+                event_id: 42,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn sign_out_does_nothing_when_not_registered() {
+        let (mut app, mut rx) = sessions_app(false);
+        app.sign_out();
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
