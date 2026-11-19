@@ -139,6 +139,33 @@ impl ApiClient {
         serde_json::from_value(list).context("decoding the available cars list")
     }
 
+    /// Pre-qualification laps of the signed-in driver for one event.
+    pub async fn prequalification(&self, event_id: u32) -> Result<PreQualiStatus> {
+        let value: Value = send_json(self.pit(&format!("hotlaps/{event_id}/me"))).await?;
+        let rows = value.get("data").cloned().unwrap_or(value);
+        let rows = rows
+            .as_array()
+            .context("unexpected pre-qualification payload")?;
+
+        let mut eligible_classes: Vec<String> = Vec::new();
+        for row in rows {
+            if !has_lap_time(row) {
+                continue;
+            }
+            let Some(class) = prequali_class(row) else {
+                continue;
+            };
+            if !eligible_classes
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&class))
+            {
+                eligible_classes.push(class);
+            }
+        }
+
+        Ok(PreQualiStatus { eligible_classes })
+    }
+
     /// Register the signed-in driver for a solo race.
     pub async fn signup(
         &self,
@@ -218,6 +245,38 @@ async fn send_json<T: DeserializeOwned>(req: reqwest::RequestBuilder) -> Result<
     })
 }
 
+fn has_lap_time(row: &Value) -> bool {
+    for key in ["best_lap", "totalTime", "lap_time"] {
+        match row.get(key) {
+            Some(Value::Number(n)) => {
+                if n.as_f64().is_some_and(|v| v > 0.0) {
+                    return true;
+                }
+            }
+            Some(Value::String(s)) => {
+                let s = s.trim();
+                if !s.is_empty() && s != "-" && s != "0" {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn prequali_class(row: &Value) -> Option<String> {
+    for key in ["class_name", "class", "car_class", "carClass", "classname"] {
+        if let Some(value) = row.get(key).and_then(Value::as_str) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Signup/withdraw return either an empty body or a JSON error (`status`, `title`).
 async fn check_ok(res: reqwest::Response) -> Result<()> {
     let status = res.status();
@@ -286,6 +345,14 @@ pub struct SeriesRef {
     pub active_week: i64,
     #[serde(default)]
     pub slug: Option<String>,
+    /// Minimum safety rating to sign up. `1` (or absent) means no requirement.
+    #[serde(default, deserialize_with = "flex_optional_f64")]
+    pub min_sr: Option<f64>,
+    #[serde(default)]
+    pub min_license: Option<String>,
+    /// The series requires a pre-qualification lap before signing up.
+    #[serde(default, deserialize_with = "flex_bool")]
+    pub prequali: bool,
     #[serde(default)]
     pub practice_server: Vec<PracticeServerDto>,
     #[serde(default)]
@@ -335,6 +402,15 @@ pub struct CatalogueEntry {
     pub name: String,
     #[serde(default, deserialize_with = "flex_bool")]
     pub dlc: bool,
+}
+
+fn flex_optional_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    let raw = Option::<Value>::deserialize(d)?;
+    Ok(match raw {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => s.trim().replace(',', ".").parse().ok(),
+        _ => None,
+    })
 }
 
 fn flex_bool<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
@@ -444,6 +520,27 @@ pub struct UserDto {
     pub vorname: String,
     #[serde(default)]
     pub nachname: String,
+    #[serde(default)]
+    pub safety_rating: Option<Value>,
+    #[serde(rename = "rating_by_sim", default)]
+    pub rating_by_sim: Vec<RatingBySimDto>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RatingBySimDto {
+    #[serde(default)]
+    pub sim_id: i64,
+    #[serde(default)]
+    pub license: String,
+    #[serde(default)]
+    pub rating: Option<Value>,
+}
+
+/// What `hotlaps/{event}/me` says about the signed-in driver.
+#[derive(Debug, Clone, Default)]
+pub struct PreQualiStatus {
+    /// Car classes the driver has set a pre-qualification lap in.
+    pub eligible_classes: Vec<String>,
 }
 
 /// One car offered by `getAvailableCars` for a race.

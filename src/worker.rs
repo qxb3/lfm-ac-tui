@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use futures_util::{stream, StreamExt};
+use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
@@ -16,8 +17,8 @@ use crate::api::{
     SeriesRef,
 };
 use crate::model::{
-    human_bytes, CarOption, ContentItem, ContentKind, JoinInfo, PracticeLink, ProgressView, RaceInfo,
-    Series, Status,
+    human_bytes, CarOption, ContentItem, ContentKind, JoinInfo, PracticeLink, Profile, ProgressView,
+    RaceInfo, Series, Status,
 };
 use crate::session;
 
@@ -35,6 +36,8 @@ pub enum Command {
     JoinRace { race_id: u32, label: String },
     /// Cars the server accepts for a race, for the sign-up picker.
     RaceCars { race_id: u32, event_id: u32 },
+    /// Pre-qualification laps of the signed-in driver for an event.
+    PreQuali(u32),
     /// Register for a race with the chosen car.
     SignUp {
         race_id: u32,
@@ -65,6 +68,13 @@ pub enum Event {
     JoinInfo(JoinInfo),
     /// Available cars for a race (`error` is set when the fetch failed).
     RaceCars { race_id: u32, cars: Vec<CarOption>, error: Option<String> },
+    /// The signed-in driver's ratings, for the header and eligibility checks.
+    Profile(Profile),
+    /// Pre-qualification classes; `Err` when the lookup failed.
+    PreQuali {
+        event_id: u32,
+        result: std::result::Result<Vec<String>, String>,
+    },
     /// Outcome of a signup/withdraw. `ok == false` leaves the popup open with `message`.
     SignupResult { race_id: u32, signed_up: bool, ok: bool, message: String },
     LoggedIn,
@@ -101,6 +111,9 @@ impl Worker {
                 }
                 Command::RaceCars { race_id, event_id } => {
                     spawn_race_cars(self.api.clone(), self.tx.clone(), race_id, event_id);
+                }
+                Command::PreQuali(event_id) => {
+                    spawn_pre_quali(self.api.clone(), self.tx.clone(), event_id);
                 }
                 Command::SignUp {
                     race_id,
@@ -157,6 +170,7 @@ impl Worker {
             Command::Sessions { .. }
             | Command::JoinRace { .. }
             | Command::RaceCars { .. }
+            | Command::PreQuali(_)
             | Command::SignUp { .. }
             | Command::Withdraw { .. } => unreachable!(),
         }
@@ -190,6 +204,13 @@ impl Worker {
     // ---------------------------------------------------------------- tasks
 
     async fn refresh(&self) -> Result<()> {
+        // Fetch the profile first: the header and the SR gate depend on it, and a failing
+        // season/catalogue request should not leave it unset.
+        match self.api.user().await {
+            Ok(user) => self.send(Event::Profile(map_profile(&user))),
+            Err(error) => self.log(format!("profile: {error:#}")),
+        }
+
         if let Ok(required) = self.api.required_version().await {
             if required != crate::api::APP_VERSION {
                 self.log(format!(
@@ -762,6 +783,26 @@ fn spawn_race_cars(
     });
 }
 
+fn spawn_pre_quali(
+    api: ApiClient,
+    tx: mpsc::UnboundedSender<Event>,
+    event_id: u32,
+) {
+    tokio::spawn(async move {
+        let result = api
+            .prequalification(event_id)
+            .await
+            .map(|status| status.eligible_classes)
+            .map_err(|error| format!("{error:#}"));
+        if let Err(error) = &result {
+            let _ = tx.send(Event::Log(format!(
+                "pre-qualification check for event {event_id}: {error}"
+            )));
+        }
+        let _ = tx.send(Event::PreQuali { event_id, result });
+    });
+}
+
 fn spawn_signup(
     api: ApiClient,
     tx: mpsc::UnboundedSender<Event>,
@@ -841,6 +882,35 @@ fn status_from(integrity: &ac::integrity::Integrity) -> Status {
     }
 }
 
+/// Assetto Corsa is sim id 3 in LFM's `rating_by_sim` list.
+const AC_SIM_ID: i64 = 3;
+
+fn map_profile(user: &crate::api::UserDto) -> Profile {
+    let ac = user.rating_by_sim.iter().find(|sim| sim.sim_id == AC_SIM_ID);
+    // The desktop app hides ELO for rookie licences; mirror that rather than showing a
+    // meaningless 1500.
+    let elo = ac
+        .filter(|sim| !sim.license.eq_ignore_ascii_case("ROOKIE"))
+        .and_then(|sim| sim.rating.as_ref())
+        .and_then(value_f64);
+
+    Profile {
+        name: format!("{} {}", user.vorname, user.nachname)
+            .trim()
+            .to_string(),
+        safety_rating: user.safety_rating.as_ref().and_then(value_f64),
+        elo,
+    }
+}
+
+fn value_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().replace(',', ".").parse().ok(),
+        _ => None,
+    }
+}
+
 fn display_name(meta: &ContentMetadata) -> String {
     if meta.name.is_empty() {
         format!("content {}", meta.id)
@@ -871,6 +941,9 @@ fn build_series(
         practice_this_week: map_practice(&reference.practice_server),
         practice_next_week: map_practice(&reference.practice_server_next_week),
         content: items,
+        min_sr: reference.min_sr,
+        min_license: reference.min_license.clone(),
+        prequali: reference.prequali,
     }
 }
 

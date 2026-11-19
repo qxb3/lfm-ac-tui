@@ -44,6 +44,11 @@ pub struct Series {
     pub practice_this_week: Vec<PracticeLink>,
     pub practice_next_week: Vec<PracticeLink>,
     pub content: Vec<ContentItem>,
+    /// Minimum safety rating for sign-up; `None` or `<= 1` means no requirement.
+    pub min_sr: Option<f64>,
+    pub min_license: Option<String>,
+    /// A pre-qualification lap is required before signing up.
+    pub prequali: bool,
 }
 
 impl Series {
@@ -90,6 +95,26 @@ pub struct RaceInfo {
     pub race_minutes: u32,
     pub signup_opens: String,
     pub signup_closes: String,
+}
+
+/// The signed-in driver, as far as eligibility and the header need it.
+#[derive(Clone, Debug, Default)]
+pub struct Profile {
+    pub name: String,
+    pub safety_rating: Option<f64>,
+    /// ELO for Assetto Corsa (`rating_by_sim` entry with sim id 3).
+    pub elo: Option<f64>,
+}
+
+/// Cached pre-qualification lookup for one event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreQuali {
+    Checking,
+    Eligible,
+    /// Checked, but no lap on record.
+    Ineligible,
+    /// The lookup failed — sign-up cannot be verified either way.
+    Unavailable,
 }
 
 /// A car the server accepts for one race, as offered in the sign-up popup.

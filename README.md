@@ -89,6 +89,18 @@ In the sign-up popup: `j`/`k` choose a car, `enter` registers, `r` reloads the c
 `u` signs out when you are already registered, and `Esc` cancels. Errors from LFM (sign-ups
 closed, full grid, missing safety rating) stay in the dialog so the reason is visible.
 
+Sign-up is gated locally before any request is made. The series payload's `min_sr` is
+checked against your profile, `prequali` against `hotlaps/{event_id}/me`, and per race the
+grid limit (`registered >= slots`), the `signupStart`/`signupCloses` window and the race
+start time. `min_license` is shown as a requirement but not enforced locally, because its
+ordering is not documented. A race that fails any check is marked with a red `✖` and its
+first reason in the Sessions list, and the dialog lists every reason and refuses to submit.
+Series with `min_sr <= 1` have no SR floor.
+
+Your Assetto Corsa ELO (`rating_by_sim` entry for sim 3, hidden for rookie licences like the
+desktop app) and safety rating (`safety_rating`) are shown in the top-right of the header,
+refreshed with the season data.
+
 The race list refreshes itself every minute while the Sessions tab is open, and the season
 (plus installed-content check) every 15 minutes on the Mods tab, so there is no refresh key.
 Refreshes are skipped while a dialog is open or a download/check is running.

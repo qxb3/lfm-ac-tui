@@ -7,12 +7,14 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind,
 };
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::model::{
-    CarOption, ContentItem, JoinInfo, PracticeLink, ProgressView, RaceInfo, Series, Status,
+    CarOption, ContentItem, JoinInfo, PracticeLink, PreQuali, Profile, ProgressView, RaceInfo,
+    Series, Status,
 };
 use crate::session;
 use crate::worker::{Command, Event};
@@ -128,6 +130,10 @@ pub struct App {
     pub join_popup: Option<JoinInfo>,
     pub join_loading: bool,
     pub signup_popup: Option<SignupPopup>,
+    /// Ratings of the signed-in driver (header + SR gate).
+    pub profile: Option<Profile>,
+    /// Pre-qualification state per event id.
+    pub pre_qualification: HashMap<u32, PreQuali>,
     /// Last race-list request, for the automatic refresh.
     last_sessions_refresh: Option<Instant>,
     /// Last season refresh, for the automatic refresh.
@@ -175,6 +181,8 @@ impl App {
             join_popup: None,
             join_loading: false,
             signup_popup: None,
+            profile: None,
+            pre_qualification: HashMap::new(),
             last_sessions_refresh: None,
             last_season_refresh: Instant::now(),
             regions: Regions::default(),
@@ -218,6 +226,24 @@ impl App {
     pub fn selected_content(&self) -> Option<&ContentItem> {
         let idx = self.content_state.selected()?;
         self.current_content().get(idx)
+    }
+
+    /// `ELO 1500 · SR 85` for the top-right corner, dashes before the profile is loaded.
+    pub fn profile_summary(&self) -> String {
+        match &self.profile {
+            Some(profile) => {
+                let elo = profile
+                    .elo
+                    .map(|value| format!("{value:.0}"))
+                    .unwrap_or_else(|| "—".to_string());
+                let sr = profile
+                    .safety_rating
+                    .map(format_rating)
+                    .unwrap_or_else(|| "—".to_string());
+                format!("ELO {elo} · SR {sr}")
+            }
+            None => "ELO — · SR —".to_string(),
+        }
     }
 
     pub fn busy_spinner(&self) -> &'static str {
@@ -391,6 +417,9 @@ impl App {
         self.races_event = Some(event_id);
         self.sessions_state.select(None);
         self.last_sessions_refresh = Some(Instant::now());
+        if self.current_series().is_some_and(|s| s.prequali) {
+            self.request_pre_quali(event_id);
+        }
         let _ = self.tx.send(Command::Sessions {
             event_id,
             quiet: false,
@@ -450,9 +479,111 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------ eligibility
+
+    fn request_pre_quali(&mut self, event_id: u32) {
+        if self.pre_qualification.contains_key(&event_id) {
+            return;
+        }
+        self.pre_qualification.insert(event_id, PreQuali::Checking);
+        let _ = self.tx.send(Command::PreQuali(event_id));
+    }
+
+    /// Requirements that apply to the whole series (safety rating, pre-qualification).
+    pub fn series_blockers(&self, series: &Series) -> Vec<String> {
+        let mut out = Vec::new();
+
+        if let Some(required) = series.min_sr.filter(|sr| *sr > 1.0) {
+            match self.profile.as_ref().and_then(|p| p.safety_rating) {
+                Some(sr) if sr + 1e-9 >= required => {}
+                Some(sr) => out.push(format!(
+                    "needs SR {} (you have {})",
+                    format_rating(required),
+                    format_rating(sr)
+                )),
+                None => out.push(format!(
+                    "needs SR {} (your SR is unavailable)",
+                    format_rating(required)
+                )),
+            }
+        }
+
+        if series.prequali {
+            match self.pre_qualification.get(&series.event_id) {
+                Some(PreQuali::Eligible) => {}
+                Some(PreQuali::Checking) | None => {
+                    out.push("checking your pre-qualification lap…".to_string())
+                }
+                Some(PreQuali::Ineligible) => {
+                    out.push("no pre-qualification lap on record for this series".to_string())
+                }
+                Some(PreQuali::Unavailable) => {
+                    out.push("pre-qualification could not be verified".to_string())
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Informational requirement summary shown in the sign-up dialog.
+    pub fn series_requirements(&self, series: &Series) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(required) = series.min_sr.filter(|sr| *sr > 1.0) {
+            out.push(format!("SR {}+", format_rating(required)));
+        }
+        if let Some(license) = &series.min_license {
+            let license = license.trim();
+            if !license.is_empty() && license != "0" {
+                out.push(format!("{license} licence"));
+            }
+        }
+        if series.prequali {
+            out.push("pre-qualification lap".to_string());
+        }
+        out
+    }
+
+    /// Everything that currently prevents signing up for one race.
+    pub fn race_blockers(&self, race: &RaceInfo) -> Vec<String> {
+        let mut out = match self.current_series() {
+            Some(series) => self.series_blockers(series),
+            None => Vec::new(),
+        };
+
+        if race.slots > 0 && race.registered >= race.slots {
+            out.push("the grid is full".to_string());
+        }
+
+        let now = Local::now();
+        if let Some(opens) = parse_race_time(&race.signup_opens) {
+            if now < opens {
+                out.push(format!("sign-ups open {}", race.signup_opens));
+            }
+        }
+        if let Some(closes) = parse_race_time(&race.signup_closes) {
+            if now > closes {
+                out.push(format!("sign-ups closed {}", race.signup_closes));
+            }
+        }
+        if let Some(start) = parse_race_time(&race.date) {
+            if now > start {
+                out.push("the race has already started".to_string());
+            }
+        }
+
+        out
+    }
+
+    pub fn signup_blockers_for(&self, race_id: u32) -> Vec<String> {
+        match self.races.iter().find(|race| race.race_id == race_id) {
+            Some(race) => self.race_blockers(race),
+            None => Vec::new(),
+        }
+    }
+
     // -------------------------------------------------------------- signup
 
-    /// Open the sign-up dialog for the highlighted race, loading its car list.
     /// Sign out of the highlighted race directly, without opening the picker.
     fn sign_out(&mut self) {
         let Some(SessionRow::Race(index)) = self.selected_session() else {
@@ -483,6 +614,7 @@ impl App {
         });
     }
 
+    /// Open the sign-up dialog for the highlighted race, loading its car list.
     fn open_signup(&mut self) {
         let Some(SessionRow::Race(index)) = self.selected_session() else {
             self.log("Select an upcoming race first");
@@ -491,9 +623,19 @@ impl App {
         let Some(race) = self.races.get(index).cloned() else {
             return;
         };
-        let Some(event_id) = self.current_series().map(|s| s.event_id) else {
+        let Some((event_id, prequali)) = self
+            .current_series()
+            .map(|s| (s.event_id, s.prequali))
+        else {
             return;
         };
+
+        if prequali && !matches!(self.pre_qualification.get(&event_id), Some(PreQuali::Checking)) {
+            // Re-check when the dialog opens: a lap may have been set since the last look,
+            // and an earlier failed lookup should not stick forever.
+            self.pre_qualification.remove(&event_id);
+            self.request_pre_quali(event_id);
+        }
 
         let label = if race.track.is_empty() {
             format!("race {}", race.race_id)
@@ -552,6 +694,12 @@ impl App {
                     // A request is already in flight.
                 } else if popup.signed_up {
                     self.log("You are already registered — press u to withdraw");
+                } else if !self.signup_blockers_for(popup.race_id).is_empty() {
+                    let blockers = self.signup_blockers_for(popup.race_id);
+                    self.log(format!(
+                        "Sign-up unavailable: {}",
+                        blockers.join(" · ")
+                    ));
                 } else if let Some(car) = popup.cars.get(popup.selected) {
                     popup.submitting = true;
                     popup.error = None;
@@ -830,6 +978,20 @@ impl App {
 
     pub fn on_event(&mut self, event: Event) {
         match event {
+            Event::Profile(profile) => {
+                if self.profile.is_none() && !profile.name.is_empty() {
+                    self.log(format!("Signed in as {}", profile.name));
+                }
+                self.profile = Some(profile);
+            }
+            Event::PreQuali { event_id, result } => {
+                let state = match result {
+                    Ok(classes) if !classes.is_empty() => PreQuali::Eligible,
+                    Ok(_) => PreQuali::Ineligible,
+                    Err(_) => PreQuali::Unavailable,
+                };
+                self.pre_qualification.insert(event_id, state);
+            }
             Event::RaceCars {
                 race_id,
                 cars,
@@ -1312,6 +1474,32 @@ impl App {
     }
 }
 
+/// LFM sends `YYYY-MM-DD HH:MM:SS` without a zone; treat it as local time like the
+/// desktop app's `new Date(value + '+1')` does. RFC 3339 values are converted too.
+fn parse_race_time(value: &str) -> Option<DateTime<Local>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+        return Some(parsed.with_timezone(&Local));
+    }
+    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(value, format) {
+            return Local.from_local_datetime(&naive).earliest();
+        }
+    }
+    None
+}
+
+fn format_rating(value: f64) -> String {
+    if (value - value.round()).abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
 fn toggle_focus(focus: Focus) -> Focus {
     match focus {
         Focus::Series => Focus::Content,
@@ -1425,6 +1613,9 @@ mod tests {
             practice_this_week: Vec::new(),
             practice_next_week: Vec::new(),
             content: Vec::new(),
+            min_sr: None,
+            min_license: None,
+            prequali: false,
         }];
         app.series_state.select(Some(0));
         app.races = vec![RaceInfo {
@@ -1437,6 +1628,82 @@ mod tests {
         // Session rows: header, then the race.
         app.sessions_state.select(Some(1));
         (app, rx)
+    }
+
+    #[test]
+    fn sr_requirement_blocks_signup_until_met() {
+        let (mut app, _rx) = sessions_app(false);
+        app.series[0].min_sr = Some(75.0);
+        app.profile = Some(Profile {
+            name: "Driver".to_string(),
+            safety_rating: Some(60.0),
+            elo: Some(1400.0),
+        });
+
+        let blockers = app.signup_blockers_for(9);
+        assert!(blockers.iter().any(|reason| reason.contains("needs SR 75")));
+
+        app.profile.as_mut().unwrap().safety_rating = Some(75.0);
+        assert!(app.signup_blockers_for(9).is_empty());
+    }
+
+    #[test]
+    fn sr_of_one_is_no_requirement() {
+        let (mut app, _rx) = sessions_app(false);
+        app.series[0].min_sr = Some(1.0);
+        app.profile = Some(Profile {
+            name: "Rookie".to_string(),
+            safety_rating: Some(5.0),
+            elo: None,
+        });
+        assert!(app.signup_blockers_for(9).is_empty());
+    }
+
+    #[test]
+    fn full_grid_and_closed_signup_block() {
+        let (mut app, _rx) = sessions_app(false);
+        app.races[0].slots = 10;
+        app.races[0].registered = 10;
+        app.races[0].signup_closes = "2000-01-01 00:00:00".to_string();
+
+        let blockers = app.signup_blockers_for(9);
+        assert!(blockers.iter().any(|reason| reason.contains("grid is full")));
+        assert!(blockers.iter().any(|reason| reason.contains("sign-ups closed")));
+    }
+
+    #[test]
+    fn prequalification_is_required_and_checked() {
+        let (mut app, _rx) = sessions_app(false);
+        app.series[0].prequali = true;
+
+        assert!(app
+            .signup_blockers_for(9)
+            .iter()
+            .any(|reason| reason.contains("checking your pre-qualification")));
+
+        app.pre_qualification
+            .insert(42, PreQuali::Ineligible);
+        assert!(app
+            .signup_blockers_for(9)
+            .iter()
+            .any(|reason| reason.contains("no pre-qualification lap")));
+
+        app.pre_qualification
+            .insert(42, PreQuali::Eligible);
+        assert!(app.signup_blockers_for(9).is_empty());
+    }
+
+    #[test]
+    fn profile_summary_shows_elo_and_sr() {
+        let (mut app, _rx) = sessions_app(false);
+        assert_eq!(app.profile_summary(), "ELO — · SR —");
+
+        app.profile = Some(Profile {
+            name: "Driver".to_string(),
+            safety_rating: Some(85.0),
+            elo: Some(1500.0),
+        });
+        assert_eq!(app.profile_summary(), "ELO 1500 · SR 85");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Ratatui rendering.
 
-use ratatui::layout::{Constraint, Layout, Margin, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, Paragraph, Wrap};
@@ -36,7 +36,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_join_popup(frame, area, &info);
     }
     if let Some(popup) = app.signup_popup.clone() {
-        draw_signup_popup(frame, area, &popup);
+        let blockers = app.signup_blockers_for(popup.race_id);
+        let requirements = app
+            .current_series()
+            .map(|series| app.series_requirements(series))
+            .unwrap_or_default();
+        draw_signup_popup(frame, area, &popup, &blockers, &requirements);
     }
     if let Some(Confirm::Purge(ids)) = app.confirm.clone() {
         draw_confirm(frame, area, ids.len());
@@ -55,9 +60,13 @@ fn push_span(spans: &mut Vec<Span<'static>>, x: &mut u16, span: Span<'static>) {
 }
 
 fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::bordered().border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
     let mut spans: Vec<Span<'static>> = Vec::new();
     // Track the column so the tabs can be hit-tested by the mouse.
-    let mut x = area.x + 1;
+    let mut x = inner.x;
 
     push_span(
         &mut spans,
@@ -96,7 +105,7 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
             ),
         );
 
-        let rect = Rect::new(start, area.y + 1, width, 1);
+        let rect = Rect::new(start, inner.y, width, 1);
         match view {
             View::Mods => app.regions.tab_mods = rect,
             View::Sessions => app.regions.tab_sessions = rect,
@@ -142,8 +151,30 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
         ));
     }
 
-    let block = Block::bordered().border_style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+    // Ratings live in the top-right corner, clipped from the left when the terminal is
+    // narrow instead of pushing the tabs off-screen.
+    let profile = app.profile_summary();
+    let profile_width = (profile.chars().count() as u16).min(inner.width);
+    let left_width = inner.width.saturating_sub(profile_width + 2);
+
+    if left_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(inner.x, inner.y, left_width, 1),
+        );
+    }
+    if profile_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                profile,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Right),
+            Rect::new(inner.x + inner.width - profile_width, inner.y, profile_width, 1),
+        );
+    }
 }
 
 fn draw_body(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -250,7 +281,7 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
                 ),
             ])),
             SessionRow::Race(index) => match app.races.get(*index) {
-                Some(race) => ListItem::new(race_line(race)),
+                Some(race) => ListItem::new(race_line(app, race)),
                 None => ListItem::new(Line::from("")),
             },
         })
@@ -267,7 +298,7 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut app.sessions_state);
 }
 
-fn race_line(race: &RaceInfo) -> Line<'static> {
+fn race_line(app: &App, race: &RaceInfo) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
             format!("  {:<12}", short_date(&race.date)),
@@ -311,6 +342,20 @@ fn race_line(race: &RaceInfo) -> Line<'static> {
             ),
             Style::default().fg(Color::DarkGray),
         ));
+    }
+
+    // Races you cannot enter are marked with the first reason; the sign-up dialog lists
+    // all of them.
+    if !race.signed_up {
+        if let Some(reason) = app.race_blockers(race).first() {
+            spans.push(Span::styled(
+                "  ✖ ",
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(clip(reason, 30), Style::default().fg(Color::Red)));
+        }
     }
 
     Line::from(spans)
@@ -629,7 +674,13 @@ fn draw_join_popup(frame: &mut Frame, area: Rect, info: &JoinInfo) {
     );
 }
 
-fn draw_signup_popup(frame: &mut Frame, area: Rect, popup: &SignupPopup) {
+fn draw_signup_popup(
+    frame: &mut Frame,
+    area: Rect,
+    popup: &SignupPopup,
+    blockers: &[String],
+    requirements: &[String],
+) {
     let rect = centered(area, 74, 60);
 
     let mut lines = vec![
@@ -646,8 +697,15 @@ fn draw_signup_popup(frame: &mut Frame, area: Rect, popup: &SignupPopup) {
             ),
             Style::default().fg(Color::Gray),
         )),
-        Line::from(""),
     ];
+
+    if !requirements.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("Requires: {}", requirements.join(" · ")),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
 
     if popup.signed_up {
         lines.push(Line::from(Span::styled(
@@ -659,6 +717,24 @@ fn draw_signup_popup(frame: &mut Frame, area: Rect, popup: &SignupPopup) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "u withdraw · Esc close",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else if !blockers.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Sign-up unavailable",
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for blocker in blockers {
+            lines.push(Line::from(vec![
+                Span::styled("  • ", Style::default().fg(Color::Red)),
+                Span::styled(blocker.clone(), Style::default().fg(Color::Red)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Esc close · r reload cars",
             Style::default().fg(Color::DarkGray),
         )));
     } else if popup.loading {
@@ -778,6 +854,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(""),
         head("SESSIONS TAB  (2)"),
         dim("  Practice servers and upcoming races for the selected series."),
+        dim("  A red ✖ marks a race you cannot enter yet (SR, pre-qualification lap, full grid, closed sign-ups)."),
         Line::from("  enter   open the practice join link or the race details"),
         Line::from("  o       in the popup: start Assetto Corsa through Steam with the link"),
         Line::from("  c / y   copy the join link / the race password"),
@@ -785,6 +862,11 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  u       sign out of the highlighted race"),
         Line::from("  w       include next week's practice servers"),
         Line::from("  o       otherwise: open the series page on lowfuelmotorsport.com"),
+        Line::from(""),
+        head("ELIGIBILITY"),
+        dim("  The top-right corner shows your Assetto Corsa ELO and safety rating."),
+        dim("  Sign-up checks the series' minimum SR, its pre-qualification lap, the grid
+  limit and the sign-up window. When something is missing the dialog explains why."),
         Line::from(""),
         head("LOGIN"),
         Line::from("  L       log in through the browser (Steam); the key is saved for next time"),
