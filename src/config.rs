@@ -105,39 +105,141 @@ pub fn is_likely_ac_path(path: &Path) -> bool {
     has_exe || (path.join("content").is_dir() && path.join("system").is_dir())
 }
 
-/// Best-effort auto-detection: Steam root from the registry, then every library in
-/// `libraryfolders.vdf` (Assetto Corsa's Steam AppID is 244210).
+/// Assetto Corsa's Steam AppID.
+const AC_APP_ID: &str = "244210";
+
+/// Folder names AC has historically been installed under, used when its app manifest
+/// cannot be read.
+const AC_DIR_NAMES: [&str; 5] = [
+    "assettocorsa",
+    "Assetto Corsa",
+    "assettocorsa_",
+    "AssettoCorsa",
+    "assettocorsa-1",
+];
+
+/// Best-effort auto-detection: every Steam root for the platform, then every library in
+/// `libraryfolders.vdf`, looking for the entry named by AC's app manifest.
 pub fn detect_ac_path() -> Option<PathBuf> {
     for root in steam_roots() {
         for library in steam_libraries(&root) {
-            for dirname in ["assettocorsa", "Assetto Corsa", "assettocorsa_"] {
-                let candidate = library.join("steamapps").join("common").join(dirname);
-                if is_likely_ac_path(&candidate) {
-                    return Some(candidate);
-                }
+            if let Some(found) = ac_in_library(&library) {
+                return Some(found);
             }
         }
     }
     None
 }
 
-fn steam_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
+/// Locate Assetto Corsa inside one Steam library. `appmanifest_244210.acf` records the
+/// real install folder name, which avoids guessing and works on case-sensitive filesystems.
+fn ac_in_library(library: &Path) -> Option<PathBuf> {
+    let steamapps = library.join("steamapps");
+    let manifest = steamapps.join(format!("appmanifest_{AC_APP_ID}.acf"));
 
-    if let Some(p) = steam_root_from_registry() {
-        roots.push(p);
+    if let Some(dirname) = std::fs::read_to_string(manifest)
+        .ok()
+        .and_then(|text| vdf_value(&text, "installdir"))
+    {
+        let candidate = steamapps.join("common").join(dirname);
+        if is_likely_ac_path(&candidate) {
+            return Some(candidate);
+        }
     }
 
-    for var in ["ProgramFiles(x86)", "ProgramFiles"] {
-        if let Ok(base) = std::env::var(var) {
-            let p = PathBuf::from(base).join("Steam");
-            if p.is_dir() {
-                roots.push(p);
+    AC_DIR_NAMES
+        .iter()
+        .map(|dirname| steamapps.join("common").join(dirname))
+        .find(|candidate| is_likely_ac_path(candidate))
+}
+
+fn steam_roots() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    #[cfg(windows)]
+    {
+        if let Some(p) = steam_root_from_registry() {
+            candidates.push(p);
+        }
+
+        for var in ["ProgramFiles(x86)", "ProgramFiles"] {
+            if let Ok(base) = std::env::var(var) {
+                candidates.push(PathBuf::from(base).join("Steam"));
             }
         }
     }
 
-    roots.dedup();
+    #[cfg(target_os = "linux")]
+    candidates.extend(linux_steam_roots());
+
+    #[cfg(target_os = "macos")]
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join("Library/Application Support/Steam"));
+    }
+
+    dedupe_existing(candidates)
+}
+
+/// Keep the roots that exist, collapsing duplicates that reach the same install through
+/// symlinks (`~/.steam/steam` -> `~/.local/share/Steam`, for example).
+fn dedupe_existing(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut roots = Vec::new();
+
+    for candidate in candidates {
+        if !candidate.is_dir() {
+            continue;
+        }
+        let key = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        roots.push(candidate);
+    }
+
+    roots
+}
+
+/// Steam locations used by the common Linux packaging routes: distro packages (Debian,
+/// Arch, Fedora, ...), the official Flatpak, and the Snap. `STEAM_*` environment
+/// variables are honoured when set, since some launchers relocate the root.
+#[cfg(target_os = "linux")]
+fn linux_steam_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    for var in ["STEAM_ROOT", "STEAM_DIR"] {
+        if let Some(value) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+            roots.push(PathBuf::from(value));
+        }
+    }
+
+    // `XDG_DATA_HOME` (defaults to ~/.local/share) holds the native install.
+    if let Some(data) = dirs::data_dir() {
+        roots.push(data.join("Steam"));
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        // Native packages; `~/.steam/*` is Steam's own symlink farm.
+        roots.push(home.join(".local/share/Steam"));
+        roots.push(home.join(".steam/steam"));
+        roots.push(home.join(".steam/root"));
+        roots.push(home.join(".steam/debian-installation"));
+
+        // Flatpak (`com.valvesoftware.Steam`), both the current and older data layouts.
+        let flatpak = home.join(".var/app/com.valvesoftware.Steam");
+        roots.push(flatpak.join("data/Steam"));
+        roots.push(flatpak.join(".local/share/Steam"));
+        roots.push(flatpak.join(".steam/steam"));
+        roots.push(flatpak.join(".steam/root"));
+
+        // Snap (`snap install steam`).
+        let snap = home.join("snap/steam/common");
+        roots.push(snap.join(".local/share/Steam"));
+        roots.push(snap.join(".steam/steam"));
+        roots.push(snap.join(".steam/root"));
+    }
+
     roots
 }
 
@@ -162,12 +264,32 @@ fn steam_root_from_registry() -> Option<PathBuf> {
     }
 }
 
-#[cfg(not(windows))]
-fn steam_root_from_registry() -> Option<PathBuf> {
-    None
+/// Read the first `"key"  "value"` pair with the given key out of Steam's VDF/ACF text.
+/// Returns `None` when the key is absent.
+fn vdf_value(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let (found, rest) = split_quoted(line.trim())?;
+        if !found.eq_ignore_ascii_case(key) {
+            return None;
+        }
+        let (value, _) = split_quoted(rest.trim_start())?;
+        if value.is_empty() {
+            None
+        } else {
+            // VDF escapes backslashes; Linux paths carry none and pass through unchanged.
+            Some(value.replace("\\\\", "\\"))
+        }
+    })
 }
 
-/// Parse `"path"  "D:\\SteamLibrary"` entries out of a Steam `libraryfolders.vdf`.
+fn split_quoted(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix('"')?;
+    let (value, rest) = rest.split_once('"')?;
+    Some((value, rest))
+}
+
+/// Parse `"path"  "D:\\SteamLibrary"` / `"path"  "/mnt/games/SteamLibrary"` entries out
+/// of a Steam `libraryfolders.vdf`.
 fn steam_libraries(steam_root: &Path) -> Vec<PathBuf> {
     let mut libraries = vec![steam_root.to_path_buf()];
     let vdf = steam_root.join("steamapps").join("libraryfolders.vdf");
@@ -175,24 +297,104 @@ fn steam_libraries(steam_root: &Path) -> Vec<PathBuf> {
         return libraries;
     };
 
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !(trimmed.starts_with("\"path\"") || trimmed.starts_with("\"Path\"")) {
-            continue;
-        }
-        if let Some(rest) = trimmed.split_once("\"path\"").map(|(_, r)| r) {
-            if let Some(value) = rest.trim().strip_prefix('"').and_then(|r| r.split('"').next()) {
-                if !value.is_empty() {
-                    libraries.push(PathBuf::from(value.replace("\\\\", "\\")));
-                }
-            }
-        }
-    }
+    // Newer clients also keep a copy under `config/`; the `steamapps` one is canonical.
+    libraries.extend(
+        text.lines()
+            .filter_map(|line| vdf_value(line.trim(), "path"))
+            .map(PathBuf::from),
+    );
 
-    libraries
+    dedupe_existing(libraries)
 }
 
 /// Documents folder holding AC's config (`gameplay.ini`, `python.ini`).
 pub fn ac_documents_dir() -> Option<PathBuf> {
     dirs::document_dir().map(|d| d.join("Assetto Corsa"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_install(root: &Path, dirname: &str) -> PathBuf {
+        let ac = root.join("steamapps").join("common").join(dirname);
+        std::fs::create_dir_all(ac.join("content")).unwrap();
+        std::fs::create_dir_all(ac.join("system")).unwrap();
+        ac
+    }
+
+    #[test]
+    fn reads_install_dir_from_app_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = fake_install(dir.path(), "assettocorsa");
+        std::fs::create_dir_all(dir.path().join("steamapps")).unwrap();
+        std::fs::write(
+            dir.path().join("steamapps/appmanifest_244210.acf"),
+            "\"AppState\"\n{\n\t\"appid\"\t\t\"244210\"\n\t\"installdir\"\t\t\"assettocorsa\"\n}\n",
+        )
+        .unwrap();
+
+        assert_eq!(ac_in_library(dir.path()), Some(expected));
+    }
+
+    #[test]
+    fn falls_back_to_known_folder_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = fake_install(dir.path(), "Assetto Corsa");
+        assert_eq!(ac_in_library(dir.path()), Some(expected));
+    }
+
+    #[test]
+    fn ignores_library_without_ac() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_install(dir.path(), "some-other-game");
+        assert_eq!(ac_in_library(dir.path()), None);
+    }
+
+    #[test]
+    fn parses_linux_library_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("games/SteamLibrary");
+        std::fs::create_dir_all(library.join("steamapps")).unwrap();
+        std::fs::create_dir_all(dir.path().join("steamapps")).unwrap();
+        std::fs::write(
+            dir.path().join("steamapps/libraryfolders.vdf"),
+            format!(
+                "\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n\t\"1\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n}}\n",
+                dir.path().display(),
+                library.display()
+            ),
+        )
+        .unwrap();
+
+        let libraries = steam_libraries(dir.path());
+        assert!(libraries.contains(&library));
+        // The root is listed twice (implicitly and in the VDF) but only kept once.
+        assert_eq!(libraries.len(), 2);
+    }
+
+    #[test]
+    fn parses_windows_escaped_library_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("steam");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::create_dir_all(dir.path().join("steamapps")).unwrap();
+        std::fs::write(
+            dir.path().join("steamapps/libraryfolders.vdf"),
+            format!(
+                "\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n}}\n",
+                library.display()
+            ),
+        )
+        .unwrap();
+
+        assert!(steam_libraries(dir.path()).contains(&library));
+    }
+
+    #[test]
+    fn vdf_value_is_case_insensitive_and_unescapes() {
+        let text = "\"AppState\"\n{\n\t\"InstallDir\"\t\t\"Assetto\\\\Corsa\"\n}\n";
+        assert_eq!(vdf_value(text, "installdir").as_deref(), Some("Assetto\\Corsa"));
+        assert_eq!(vdf_value(text, "missing"), None);
+    }
 }
