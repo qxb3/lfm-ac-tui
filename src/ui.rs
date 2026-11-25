@@ -6,7 +6,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Confirm, Focus, SessionRow, SignupPopup, View};
+use chrono::Local;
+
+use crate::app::{parse_race_time, App, Confirm, Focus, SessionRow, SignupPopup, View};
 use crate::model::{human_bytes, ContentItem, JoinInfo, RaceInfo, Status};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -314,6 +316,17 @@ fn race_line(app: &App, race: &RaceInfo) -> Line<'static> {
         ),
     ];
 
+    if let Some(text) = countdown(&race.date) {
+        let soon = parse_race_time(&race.date)
+            .map(|start| (start - Local::now()).num_seconds() < 3600)
+            .unwrap_or(false);
+        spans.push(Span::styled(
+            format!(" {text}"),
+            Style::default()
+                .fg(if soon { Color::Yellow } else { Color::Cyan })
+                .add_modifier(if soon { Modifier::BOLD } else { Modifier::empty() }),
+        ));
+    }
     if race.signed_up {
         spans.push(Span::styled(
             " you",
@@ -359,6 +372,26 @@ fn race_line(app: &App, race: &RaceInfo) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+/// Time until a race starts: "in 2d 04h", "in 3h 05m", "in 42m 10s", "in 9s".
+/// `None` once the start time has passed or cannot be parsed.
+fn countdown(date: &str) -> Option<String> {
+    let start = parse_race_time(date)?;
+    let secs = (start - Local::now()).num_seconds();
+    if secs <= 0 {
+        return None;
+    }
+    let text = if secs >= 86_400 {
+        format!("in {}d {:02}h", secs / 86_400, (secs % 86_400) / 3600)
+    } else if secs >= 3600 {
+        format!("in {}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("in {}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("in {secs}s")
+    };
+    Some(text)
 }
 
 /// "2026-11-20 18:00:00" -> "11-20 18:00"
@@ -479,15 +512,17 @@ fn draw_content(frame: &mut Frame, app: &mut App, area: Rect) {
     let content: Vec<ContentItem> = app.current_content().to_vec();
 
     if content.is_empty() {
+        let hint = if app.token_present {
+            "The season loads automatically. Nothing to show yet."
+        } else {
+            "Press L to log in through Steam (or pass --api-key) to load the season."
+        };
         let paragraph = Paragraph::new(vec![
             Line::from(Span::styled(
                 "No series loaded.",
                 Style::default().fg(Color::Gray),
             )),
-            Line::from(Span::styled(
-                "Press r to fetch the current LFM season.",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
         ])
         .block(dark_block(&title, app.focus == Focus::Content));
         frame.render_widget(paragraph, area);
@@ -865,8 +900,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(""),
         head("ELIGIBILITY"),
         dim("  The top-right corner shows your Assetto Corsa ELO and safety rating."),
-        dim("  Sign-up checks the series' minimum SR, its pre-qualification lap, the grid
-  limit and the sign-up window. When something is missing the dialog explains why."),
+        dim("  Sign-up checks the series' minimum SR, its pre-qualification lap, the grid limit and the sign-up window. When something is missing the dialog explains why."),
         Line::from(""),
         head("LOGIN"),
         Line::from("  L       log in through the browser (Steam); the key is saved for next time"),

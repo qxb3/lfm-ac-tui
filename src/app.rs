@@ -938,7 +938,12 @@ impl App {
         }
         let ids = self.all_tracked_ids();
         if ids.is_empty() {
-            self.log("Nothing to verify — press r to load the season first");
+            let hint = if self.token_present {
+                "Nothing to verify yet — the season is still loading"
+            } else {
+                "Nothing to verify — log in with L first"
+            };
+            self.log(hint);
             return;
         }
         self.log(format!("Verifying {} content item(s)…", ids.len()));
@@ -1476,7 +1481,7 @@ impl App {
 
 /// LFM sends `YYYY-MM-DD HH:MM:SS` without a zone; treat it as local time like the
 /// desktop app's `new Date(value + '+1')` does. RFC 3339 values are converted too.
-fn parse_race_time(value: &str) -> Option<DateTime<Local>> {
+pub fn parse_race_time(value: &str) -> Option<DateTime<Local>> {
     let value = value.trim();
     if value.is_empty() {
         return None;
