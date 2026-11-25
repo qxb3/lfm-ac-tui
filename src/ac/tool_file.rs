@@ -96,6 +96,26 @@ pub fn find_markers(ac: &Path, content_id: u32) -> Vec<(PathBuf, ContentToolFile
     found
 }
 
+/// Every marker under the install, grouped by content id. One directory scan replaces a
+/// separate scan per content item.
+pub fn marker_index(ac: &Path) -> std::collections::HashMap<u32, Vec<ContentToolFile>> {
+    let mut map: std::collections::HashMap<u32, Vec<ContentToolFile>> = Default::default();
+    for dir in search_dirs(ac) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            if let Some(data) = read_marker(&entry.path().join(MARKER_NAME)) {
+                map.entry(data.content_id).or_default().push(data);
+            }
+        }
+    }
+    map
+}
+
 pub fn remove_markers(ac: &Path, content_id: u32) -> Result<usize> {
     let markers = find_markers(ac, content_id);
     let mut removed = 0;

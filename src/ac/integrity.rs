@@ -8,13 +8,14 @@
 //!
 //! Markers are still read, but only to detect an explicit version change.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::Deserialize;
 
 use crate::ac::index::PathIndex;
 use crate::ac::safe_join;
-use crate::ac::tool_file;
+use crate::ac::tool_file::{self, ContentToolFile};
 use crate::api::ContentMetadata;
 
 /// Above this share of expected files, content counts as "installed but incomplete"
@@ -75,6 +76,17 @@ impl Integrity {
 }
 
 pub fn check_with_index(index: &PathIndex, ac: &Path, meta: &ContentMetadata) -> Integrity {
+    let markers = tool_file::marker_index(ac);
+    check_with_markers(index, ac, meta, &markers)
+}
+
+/// Like `check_with_index`, but reuses a marker map built once for a whole batch of checks.
+pub fn check_with_markers(
+    index: &PathIndex,
+    ac: &Path,
+    meta: &ContentMetadata,
+    markers: &HashMap<u32, Vec<ContentToolFile>>,
+) -> Integrity {
     let structure = parse_structure(&meta.content_structure);
 
     let mut total = 0usize;
@@ -103,8 +115,8 @@ pub fn check_with_index(index: &PathIndex, ac: &Path, meta: &ContentMetadata) ->
         present == total
     };
 
-    let markers = tool_file::find_markers(ac, meta.id);
-    let hash_mismatch = !markers.is_empty() && markers.iter().any(|(_, m)| m.hash != meta.hash);
+    let own = markers.get(&meta.id).map(Vec::as_slice).unwrap_or(&[]);
+    let hash_mismatch = own.iter().any(|m| m.hash != meta.hash);
 
     Integrity {
         is_installed: full,
